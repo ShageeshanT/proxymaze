@@ -31,41 +31,19 @@ _PROBE_HEADERS = {
 
 
 async def _probe_one(client: httpx.AsyncClient, url: str, timeout_s: float) -> bool:
-    """Return True iff the URL is "up".
+    """Strict classification per spec:
+    - 2xx response within request_timeout_ms ⇒ up
+    - timeout, connection failure/refusal, or any 5xx ⇒ down
+    - 4xx, 3xx-final, anything-else ⇒ down (not 2xx)
 
-    Strategy: follow the redirect chain to see the real backend status
-    (capture servers commonly return 301 to an HTTPS endpoint that
-    encodes the real up/down state). Classification rules:
-
-    - Final response is 2xx → ``up``.
-    - Final response is 4xx → ``down`` (server reachable but rejecting).
-    - Final response is 5xx → distinguish:
-        * 502/503/504 from the upstream after a redirect chain often
-          means the redirect target is misconfigured rather than the
-          monitored proxy being down. If we *did* receive a 3xx from
-          the original URL, treat that 3xx as an "alive" signal and
-          mark ``up`` — the proxy responded.
-        * Direct 5xx (no redirect, or 500) → ``down``.
-    - Timeout / connection error → ``down``.
+    Redirects are followed so the FINAL status is what's classified;
+    we never override a 5xx with "alive" inferences.
     """
     try:
         r = await client.get(
             url, timeout=timeout_s, follow_redirects=True, headers=_PROBE_HEADERS,
         )
-        if 200 <= r.status_code < 300:
-            return True
-        if r.status_code == 502 and r.history:
-            # Specifically: a redirect chain that ends in 502 Bad Gateway
-            # is almost always an infrastructure issue (upstream of a CDN
-            # or proxy can't be reached), not a real "service down" from
-            # the monitored proxy's perspective. The 3xx was the
-            # monitored proxy responding alive. 503 (Service Unavailable)
-            # and 504 (Gateway Timeout) ARE meaningful "down" signals
-            # — we don't override those.
-            for hop in r.history:
-                if 300 <= hop.status_code < 400:
-                    return True
-        return False
+        return 200 <= r.status_code < 300
     except Exception:
         return False
 

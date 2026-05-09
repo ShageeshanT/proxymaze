@@ -104,14 +104,10 @@ async def test_b3_12_history_appended_chronologically(proxy_server: MockProxySer
     assert timestamps == sorted(timestamps)
 
 
-async def test_b3_redirect_to_502_marks_up() -> None:
-    """301 → 502 (Bad Gateway) classifies as ``up`` — trust the 3xx.
-
-    Real-world cause: judge capture servers commonly return 301 to an
-    HTTPS endpoint whose CDN backend returns 502 from the deploy
-    environment. The 3xx itself proves the proxy is alive; treating the
-    final 502 as authoritative would falsely mark every healthy proxy
-    as ``down``.
+async def test_b3_redirect_to_502_marks_down() -> None:
+    """301 → 502 (Bad Gateway) classifies as ``down`` per spec:
+    "any 5xx response ⇒ down". The final status is what matters; we
+    never override a 5xx with "alive" inferences from a redirect hop.
     """
     import threading, socket, time
     from contextlib import closing
@@ -148,7 +144,7 @@ async def test_b3_redirect_to_502_marks_up() -> None:
     try:
         state.proxies["redir-1"] = Proxy(id="redir-1", url=f"http://127.0.0.1:{port}/proxy/redir-1")
         await _probe_once(timeout_ms=2000)
-        assert state.proxies["redir-1"].status == "up"
+        assert state.proxies["redir-1"].status == "down"
     finally:
         server.should_exit = True
         th.join(timeout=2)

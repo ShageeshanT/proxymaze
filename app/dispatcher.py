@@ -9,15 +9,16 @@ Processing the queue serially preserves event order across receivers
 (spec rule 5.6: ``alert.resolved`` for the old alert must arrive
 before ``alert.fired`` for the new one on a re-breach).
 
-Retry budget is sized so the entire chain completes within 60s
-(evaluator's per-event window): 4 attempts, delays 1+2+4+8 = 15s of
-sleep, plus per-attempt 8s timeout = ~47s worst case.
+Each event has a 60s deadline measured from the moment it was enqueued
+(i.e. the moment of the underlying state transition). Retry budget is
+sized to fit comfortably inside that window even when the receiver is
+flaky.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Iterable
+import time
 
 import httpx
 
@@ -25,15 +26,17 @@ from app.state import state
 
 log = logging.getLogger("proxymaze.dispatcher")
 
-# Backoff schedule (seconds). Total retry sleep = sum(RETRY_DELAYS).
-# Sized to keep the whole delivery under the 60s evaluator deadline
-# even when every attempt times out.
+# Backoff schedule (seconds). The dispatcher uses min(delay, remaining)
+# so it never overshoots the 60s deadline.
 RETRY_DELAYS: tuple[int, ...] = (1, 2, 4, 8)
 RETRYABLE_STATUS = {408, 425, 429, 500, 502, 503, 504}
-REQUEST_TIMEOUT_S = 8.0
+REQUEST_TIMEOUT_S = 6.0
+PER_EVENT_DEADLINE_S = 60.0
+
 DISPATCH_HEADERS = {
     "User-Agent": "ProxyMaze-Webhook/1.0",
     "Accept": "*/*",
+    "Content-Type": "application/json",
 }
 
 
@@ -62,20 +65,19 @@ def _build_targets(event_type: str, payload: dict) -> list[tuple[str, dict, str]
     return targets
 
 
-import time
-
-RETRY_DELAYS: tuple[int, ...] = (1, 2, 4, 8, 16, 30)
-
 def _get_delay(attempt: int) -> float:
     if attempt < len(RETRY_DELAYS):
         return float(RETRY_DELAYS[attempt])
     if RETRY_DELAYS:
         return float(RETRY_DELAYS[-1])
-    return 30.0
+    return 1.0
+
 
 async def _deliver_one(
     client: httpx.AsyncClient, url: str, body: dict, key: str, deadline: float
 ) -> None:
+    """POST ``body`` to ``url`` with retries, until success, deadline, or
+    a non-retryable response. Idempotent via ``state.delivered_keys``."""
     if key in state.delivered_keys:
         return
     attempt = 0
@@ -86,7 +88,7 @@ async def _deliver_one(
                 json=body,
                 timeout=REQUEST_TIMEOUT_S,
                 headers=DISPATCH_HEADERS,
-                follow_redirects=True,
+                follow_redirects=False,
             )
             if 200 <= r.status_code < 300:
                 state.delivered_keys.add(key)
@@ -94,46 +96,39 @@ async def _deliver_one(
                 log.info("delivered %s -> %s (status=%d)", key, url, r.status_code)
                 return
             if r.status_code in RETRYABLE_STATUS:
-                if deadline - time.monotonic() <= 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
                     break
-                delay = _get_delay(attempt)
-                sleep_time = min(delay, max(0.0, deadline - time.monotonic()))
-                log.warning("retry %s after %ss (status=%d, remaining=%.1fs)", key, sleep_time, r.status_code, deadline - time.monotonic())
+                sleep_time = min(_get_delay(attempt), max(0.0, remaining))
+                log.warning(
+                    "retry %s after %.2fs (status=%d, remaining=%.1fs)",
+                    key, sleep_time, r.status_code, remaining,
+                )
                 await asyncio.sleep(sleep_time)
                 attempt += 1
                 continue
-            log.warning("drop %s status=%d", key, r.status_code)
+            log.warning("drop %s status=%d (non-retryable)", key, r.status_code)
             return
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001 — network/transport errors
-            if deadline - time.monotonic() <= 0:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 break
-            delay = _get_delay(attempt)
-            sleep_time = min(delay, max(0.0, deadline - time.monotonic()))
-            log.warning("retry %s after %ss (err=%s: %s, remaining=%.1fs)", key, sleep_time, type(e).__name__, e, deadline - time.monotonic())
+            sleep_time = min(_get_delay(attempt), max(0.0, remaining))
+            log.warning(
+                "retry %s after %.2fs (err=%s: %s, remaining=%.1fs)",
+                key, sleep_time, type(e).__name__, e, remaining,
+            )
             await asyncio.sleep(sleep_time)
             attempt += 1
             continue
-    log.warning("drop %s (retries exhausted or deadline reached)", key)
+    log.warning("drop %s (deadline reached)", key)
 
 
 async def deliver_event(event: dict) -> None:
     event_type = event["type"]
-    alert_id = event.get("alert_id")
-    if not alert_id and "payload" in event:
-        alert_id = event["payload"].get("alert_id")
-    
-    if not alert_id:
-        log.warning("no alert_id in event")
-        return
-        
-    try:
-        from app.alerts import build_dynamic_payload_for_event
-        payload = build_dynamic_payload_for_event(event_type, alert_id)
-    except ImportError:
-        payload = event.get("payload")
-        
+    payload = event.get("payload")
     if not payload:
         log.info("no payload for %s", event_type)
         return
@@ -143,14 +138,14 @@ async def deliver_event(event: dict) -> None:
         log.info("no receivers for %s", event_type)
         return
     log.info("dispatching %s to %d receiver(s)", event_type, len(targets))
-    
-    deadline = event.get("queued_at", time.monotonic()) + 60.0
-    
-    # One client per event keeps connection pools small while still
-    # parallelizing delivery to all receivers.
+
+    queued_at = event.get("queued_at", time.monotonic())
+    deadline = queued_at + PER_EVENT_DEADLINE_S
+
     async with httpx.AsyncClient() as client:
         await asyncio.gather(
-            *(_deliver_one(client, url, body, key, deadline) for url, body, key in targets),
+            *(_deliver_one(client, url, body, key, deadline)
+              for url, body, key in targets),
             return_exceptions=True,
         )
 
