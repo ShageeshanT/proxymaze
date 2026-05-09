@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Response, status
 
-from app.alerts import evaluate_alerts
+from app.alerts import evaluate_alerts  # used by DELETE
 from app.models import ProxiesBody
 from app.state import Proxy, state
 from app.utils import extract_proxy_id
@@ -45,12 +45,11 @@ async def post_proxies(body: ProxiesBody) -> dict:
             proxy = Proxy(id=pid, url=url)
             state.proxies[pid] = proxy
             added.append(proxy)
-    # A replace can drop currently-down proxies, which may resolve an
-    # active alert; re-evaluate so /alerts and webhooks update promptly.
-    if body.replace:
-        await evaluate_alerts()
-    # Wake the prober so newly added proxies get their first probe within
-    # ~0.5s instead of after a full check_interval_seconds wait.
+    # Don't run evaluate_alerts here. New proxies start in ``pending``
+    # (neither up nor down), so a freshly-replaced pool would always
+    # look like 0% failure and falsely resolve any active alert. The
+    # prober's next cycle — which the wake event triggers within ~0.5s —
+    # will probe the new proxies, classify them, then evaluate.
     state.wake_event.set()
     return {
         "accepted": len(added),
