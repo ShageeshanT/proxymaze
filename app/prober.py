@@ -87,10 +87,21 @@ async def prober_loop() -> None:
                 await evaluate_alerts()
             except Exception:
                 log.exception("probe cycle failed")
+            # Sleep in 0.5s chunks so config changes take effect within
+            # ~half a second. Also break out early if a route handler
+            # signals that the pool changed (POST/DELETE /proxies) — this
+            # gives newly-added proxies a real status almost immediately
+            # instead of leaving them in ``pending`` for up to one full
+            # interval.
             elapsed = 0.0
             while elapsed < state.config.check_interval_seconds:
                 step = min(0.5, state.config.check_interval_seconds - elapsed)
-                await asyncio.sleep(step)
+                try:
+                    await asyncio.wait_for(state.wake_event.wait(), timeout=step)
+                    state.wake_event.clear()
+                    break
+                except asyncio.TimeoutError:
+                    pass
                 elapsed += step
     except asyncio.CancelledError:
         log.info("prober loop cancelled")

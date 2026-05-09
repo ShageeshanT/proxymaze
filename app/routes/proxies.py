@@ -49,6 +49,9 @@ async def post_proxies(body: ProxiesBody) -> dict:
     # active alert; re-evaluate so /alerts and webhooks update promptly.
     if body.replace:
         await evaluate_alerts()
+    # Wake the prober so newly added proxies get their first probe within
+    # ~0.5s instead of after a full check_interval_seconds wait.
+    state.wake_event.set()
     return {
         "accepted": len(added),
         "proxies": [
@@ -75,6 +78,7 @@ async def delete_proxies() -> Response:
         state.proxies.clear()
     # An empty pool has failure_rate 0 -> any active alert resolves.
     await evaluate_alerts()
+    state.wake_event.set()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 

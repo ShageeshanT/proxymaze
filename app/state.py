@@ -90,6 +90,7 @@ class State:
     _alert_lock: asyncio.Lock | None = None
     _state_lock: asyncio.Lock | None = None
     _event_queue: asyncio.Queue | None = None
+    _wake_event: asyncio.Event | None = None
 
     @property
     def alert_lock(self) -> asyncio.Lock:
@@ -109,6 +110,14 @@ class State:
             self._event_queue = asyncio.Queue()
         return self._event_queue
 
+    @property
+    def wake_event(self) -> asyncio.Event:
+        """Set by route handlers (POST/DELETE proxies) so the prober
+        loop breaks out of its sleep early and probes the new pool."""
+        if self._wake_event is None:
+            self._wake_event = asyncio.Event()
+        return self._wake_event
+
     def reset(self) -> None:
         """Wipe everything — used by tests between cases."""
         self.config = Config()
@@ -122,6 +131,7 @@ class State:
         self._alert_lock = None
         self._state_lock = None
         self._event_queue = None
+        self._wake_event = None
 
 
 state = State()
