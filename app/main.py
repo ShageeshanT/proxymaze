@@ -13,8 +13,9 @@ from typing import AsyncIterator
 
 from fastapi import FastAPI
 
+from app.dispatcher import dispatcher_loop
 from app.prober import prober_loop
-from app.routes import alerts, config, health, proxies
+from app.routes import alerts, config, health, proxies, webhooks
 
 logging.basicConfig(
     level=logging.INFO,
@@ -27,12 +28,12 @@ log = logging.getLogger("proxymaze")
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     log.info("ProxyMaze starting up")
     prober_task = asyncio.create_task(prober_loop(), name="prober")
-    # Webhook dispatcher task is added in Phase 6.
+    dispatcher_task = asyncio.create_task(dispatcher_loop(), name="dispatcher")
     try:
         yield
     finally:
         log.info("ProxyMaze shutting down")
-        for task in (prober_task,):
+        for task in (prober_task, dispatcher_task):
             task.cancel()
             try:
                 await task
@@ -51,3 +52,4 @@ app.include_router(health.router)
 app.include_router(config.router)
 app.include_router(proxies.router)
 app.include_router(alerts.router)
+app.include_router(webhooks.router)
