@@ -15,7 +15,7 @@ from fastapi import FastAPI
 
 from app.dispatcher import dispatcher_loop
 from app.prober import prober_loop
-from app.routes import alerts, config, health, proxies, webhooks
+from app.routes import alerts, config, health, integrations, metrics, proxies, webhooks
 
 logging.basicConfig(
     level=logging.INFO,
@@ -53,3 +53,5 @@ app.include_router(config.router)
 app.include_router(proxies.router)
 app.include_router(alerts.router)
 app.include_router(webhooks.router)
+app.include_router(integrations.router)
+app.include_router(metrics.router)
