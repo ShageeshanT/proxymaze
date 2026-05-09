@@ -22,11 +22,24 @@ log = logging.getLogger("proxymaze.prober")
 # Cap per-proxy history to keep memory bounded across long runs.
 HISTORY_CAP = 100
 
+# Look like a normal HTTP client so capture servers that filter on
+# user-agent don't reject our probes.
+_PROBE_HEADERS = {
+    "User-Agent": "ProxyMaze/1.0 (+https://github.com/proxymaze)",
+    "Accept": "*/*",
+}
+
 
 async def _probe_one(client: httpx.AsyncClient, url: str, timeout_s: float) -> bool:
-    """Return True iff the URL replied 2xx within the timeout."""
+    """Return True iff the URL eventually replied 2xx within the timeout.
+
+    Follows redirects (capture servers commonly return 301/302) so a
+    healthy URL that bounces through a CDN still classifies as ``up``.
+    """
     try:
-        r = await client.get(url, timeout=timeout_s)
+        r = await client.get(
+            url, timeout=timeout_s, follow_redirects=True, headers=_PROBE_HEADERS,
+        )
         return 200 <= r.status_code < 300
     except Exception:
         return False
@@ -37,7 +50,9 @@ async def probe_pool(proxies: Iterable[Proxy], timeout_ms: int) -> None:
     if not targets:
         return
     timeout_s = timeout_ms / 1000
-    async with httpx.AsyncClient() as client:
+    # Generous connection pool so 200+ concurrent probes don't queue.
+    limits = httpx.Limits(max_connections=500, max_keepalive_connections=100)
+    async with httpx.AsyncClient(limits=limits) as client:
         results = await asyncio.gather(
             *(_probe_one(client, p.url, timeout_s) for p in targets),
             return_exceptions=False,
@@ -59,16 +74,24 @@ async def probe_pool(proxies: Iterable[Proxy], timeout_ms: int) -> None:
 
 
 async def prober_loop() -> None:
+    """Forever-loop. Re-reads config every tick AND sleeps in 0.5s
+    chunks so a freshly POSTed ``check_interval_seconds`` takes effect
+    within ~half a second instead of after the previous full sleep."""
     log.info("prober loop starting")
     try:
         while True:
-            cfg = state.config
             try:
-                await probe_pool(list(state.proxies.values()), cfg.request_timeout_ms)
+                await probe_pool(
+                    list(state.proxies.values()), state.config.request_timeout_ms
+                )
                 await evaluate_alerts()
             except Exception:
                 log.exception("probe cycle failed")
-            await asyncio.sleep(cfg.check_interval_seconds)
+            elapsed = 0.0
+            while elapsed < state.config.check_interval_seconds:
+                step = min(0.5, state.config.check_interval_seconds - elapsed)
+                await asyncio.sleep(step)
+                elapsed += step
     except asyncio.CancelledError:
         log.info("prober loop cancelled")
         raise

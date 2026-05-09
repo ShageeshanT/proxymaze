@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Response, status
 
+from app.alerts import evaluate_alerts
 from app.models import ProxiesBody
 from app.state import Proxy, state
 from app.utils import extract_proxy_id
@@ -35,14 +36,19 @@ def _pool_counts() -> tuple[int, int, int, float]:
 
 @router.post("/proxies", status_code=status.HTTP_201_CREATED)
 async def post_proxies(body: ProxiesBody) -> dict:
-    if body.replace:
-        state.proxies.clear()
     added: list[Proxy] = []
-    for url in body.proxies:
-        pid = extract_proxy_id(url)
-        proxy = Proxy(id=pid, url=url)
-        state.proxies[pid] = proxy
-        added.append(proxy)
+    async with state.state_lock:
+        if body.replace:
+            state.proxies.clear()
+        for url in body.proxies:
+            pid = extract_proxy_id(url)
+            proxy = Proxy(id=pid, url=url)
+            state.proxies[pid] = proxy
+            added.append(proxy)
+    # A replace can drop currently-down proxies, which may resolve an
+    # active alert; re-evaluate so /alerts and webhooks update promptly.
+    if body.replace:
+        await evaluate_alerts()
     return {
         "accepted": len(added),
         "proxies": [
@@ -65,7 +71,10 @@ async def get_proxies() -> dict:
 
 @router.delete("/proxies", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_proxies() -> Response:
-    state.proxies.clear()
+    async with state.state_lock:
+        state.proxies.clear()
+    # An empty pool has failure_rate 0 -> any active alert resolves.
+    await evaluate_alerts()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
