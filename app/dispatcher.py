@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from urllib.parse import urljoin
 
 import httpx
 
@@ -32,6 +33,10 @@ RETRY_DELAYS: tuple[int, ...] = (1, 2, 4, 8)
 RETRYABLE_STATUS = {408, 425, 429, 500, 502, 503, 504}
 REQUEST_TIMEOUT_S = 6.0
 PER_EVENT_DEADLINE_S = 60.0
+# Cap manual redirect hops. httpx's built-in follow downgrades POST→GET
+# on 301/302/303 per RFC 7231, dropping the body — so we re-POST manually
+# to the Location header and preserve method + payload.
+MAX_REDIRECTS = 5
 
 DISPATCH_HEADERS = {
     "User-Agent": "ProxyMaze-Webhook/1.0",
@@ -73,6 +78,36 @@ def _get_delay(attempt: int) -> float:
     return 1.0
 
 
+async def _post_following_redirects(
+    client: httpx.AsyncClient, url: str, body: dict
+) -> httpx.Response:
+    """POST and manually follow up to MAX_REDIRECTS 3xx hops, preserving
+    method and JSON body. The judge's capture URL is registered as
+    ``http://...`` and 301-redirects to ``https://...``; httpx's built-in
+    redirect follower would re-issue as GET (dropping the body) so the
+    capture server never sees the POST. We re-POST to ``Location`` so it
+    arrives intact."""
+    current_url = url
+    r: httpx.Response | None = None
+    for _ in range(MAX_REDIRECTS + 1):
+        r = await client.post(
+            current_url,
+            json=body,
+            timeout=REQUEST_TIMEOUT_S,
+            headers=DISPATCH_HEADERS,
+            follow_redirects=False,
+        )
+        if 300 <= r.status_code < 400:
+            location = r.headers.get("location")
+            if not location:
+                return r
+            current_url = urljoin(current_url, location)
+            continue
+        return r
+    assert r is not None
+    return r
+
+
 async def _deliver_one(
     client: httpx.AsyncClient, url: str, body: dict, key: str, deadline: float
 ) -> None:
@@ -83,13 +118,7 @@ async def _deliver_one(
     attempt = 0
     while time.monotonic() < deadline:
         try:
-            r = await client.post(
-                url,
-                json=body,
-                timeout=REQUEST_TIMEOUT_S,
-                headers=DISPATCH_HEADERS,
-                follow_redirects=False,
-            )
+            r = await _post_following_redirects(client, url, body)
             if 200 <= r.status_code < 300:
                 state.delivered_keys.add(key)
                 state.metrics.webhook_deliveries += 1

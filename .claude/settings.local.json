@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(railway --version)",
+      "Bash(railway link *)",
+      "Bash(railway logs *)",
+      "Bash(railway ssh *)",
+      "Bash(python -m pytest -q -m \"not slow\")",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)"
+    ]
+  }
+}
