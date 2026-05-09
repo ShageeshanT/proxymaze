@@ -12,7 +12,7 @@ from typing import AsyncIterator
 
 from fastapi import FastAPI
 
-from app.routes import health
+from app.routes import config, health, proxies
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,3 +39,5 @@ app = FastAPI(
 )
 
 app.include_router(health.router)
+app.include_router(config.router)
+app.include_router(proxies.router)
