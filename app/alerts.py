@@ -55,8 +55,40 @@ def _build_resolved_payload(alert: Alert) -> dict:
     }
 
 
+def build_dynamic_payload_for_event(event_type: str, alert_id: str) -> dict | None:
+    """Builds the webhook payload dynamically using live pool values."""
+    alert = next((a for a in state.alerts if a.alert_id == alert_id), None)
+    if not alert:
+        return None
+
+    if event_type == "alert.fired":
+        total, failed, failed_ids, failure_rate = _pool_snapshot()
+        return {
+            "event": "alert.fired",
+            "alert_id": alert.alert_id,
+            "fired_at": alert.fired_at,
+            "failure_rate": failure_rate,
+            "total_proxies": total,
+            "failed_proxies": failed,
+            "failed_proxy_ids": failed_ids,
+            "threshold": THRESHOLD,
+            "message": MESSAGE,
+        }
+    elif event_type == "alert.resolved":
+        return {
+            "event": "alert.resolved",
+            "alert_id": alert.alert_id,
+            "resolved_at": alert.resolved_at,
+        }
+    return None
+
 async def _enqueue(event_type: str, payload: dict) -> None:
-    await state.event_queue.put({"type": event_type, "payload": payload})
+    import time
+    await state.event_queue.put({
+        "type": event_type, 
+        "payload": payload, 
+        "queued_at": time.monotonic()
+    })
 
 
 async def evaluate_alerts() -> None:

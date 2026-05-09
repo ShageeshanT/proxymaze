@@ -62,12 +62,24 @@ def _build_targets(event_type: str, payload: dict) -> list[tuple[str, dict, str]
     return targets
 
 
+import time
+
+RETRY_DELAYS: tuple[int, ...] = (1, 2, 4, 8, 16, 30)
+
+def _get_delay(attempt: int) -> float:
+    if attempt < len(RETRY_DELAYS):
+        return float(RETRY_DELAYS[attempt])
+    if RETRY_DELAYS:
+        return float(RETRY_DELAYS[-1])
+    return 30.0
+
 async def _deliver_one(
-    client: httpx.AsyncClient, url: str, body: dict, key: str
+    client: httpx.AsyncClient, url: str, body: dict, key: str, deadline: float
 ) -> None:
     if key in state.delivered_keys:
         return
-    for delay in (*RETRY_DELAYS, None):
+    attempt = 0
+    while time.monotonic() < deadline:
         try:
             r = await client.post(
                 url,
@@ -81,36 +93,64 @@ async def _deliver_one(
                 state.metrics.webhook_deliveries += 1
                 log.info("delivered %s -> %s (status=%d)", key, url, r.status_code)
                 return
-            if r.status_code in RETRYABLE_STATUS and delay is not None:
-                log.warning(
-                    "retry %s after %ss (status=%d)", key, delay, r.status_code
-                )
-                await asyncio.sleep(delay)
+            if r.status_code in RETRYABLE_STATUS:
+                if deadline - time.monotonic() <= 0:
+                    break
+                delay = _get_delay(attempt)
+                sleep_time = min(delay, max(0.0, deadline - time.monotonic()))
+                log.warning("retry %s after %ss (status=%d, remaining=%.1fs)", key, sleep_time, r.status_code, deadline - time.monotonic())
+                await asyncio.sleep(sleep_time)
+                attempt += 1
                 continue
             log.warning("drop %s status=%d", key, r.status_code)
             return
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001 — network/transport errors
-            if delay is not None:
-                log.warning("retry %s after %ss (err=%s: %s)", key, delay, type(e).__name__, e)
-                await asyncio.sleep(delay)
-                continue
-            log.warning("drop %s (retries exhausted: %s: %s)", key, type(e).__name__, e)
-            return
+            if deadline - time.monotonic() <= 0:
+                break
+            delay = _get_delay(attempt)
+            sleep_time = min(delay, max(0.0, deadline - time.monotonic()))
+            log.warning("retry %s after %ss (err=%s: %s, remaining=%.1fs)", key, sleep_time, type(e).__name__, e, deadline - time.monotonic())
+            await asyncio.sleep(sleep_time)
+            attempt += 1
+            continue
+    log.warning("drop %s (retries exhausted or deadline reached)", key)
 
 
 async def deliver_event(event: dict) -> None:
-    targets = _build_targets(event["type"], event["payload"])
-    if not targets:
-        log.info("no receivers for %s", event["type"])
+    event_type = event["type"]
+    alert_id = event.get("alert_id")
+    if not alert_id and "payload" in event:
+        alert_id = event["payload"].get("alert_id")
+    
+    if not alert_id:
+        log.warning("no alert_id in event")
         return
-    log.info("dispatching %s to %d receiver(s)", event["type"], len(targets))
+        
+    try:
+        from app.alerts import build_dynamic_payload_for_event
+        payload = build_dynamic_payload_for_event(event_type, alert_id)
+    except ImportError:
+        payload = event.get("payload")
+        
+    if not payload:
+        log.info("no payload for %s", event_type)
+        return
+
+    targets = _build_targets(event_type, payload)
+    if not targets:
+        log.info("no receivers for %s", event_type)
+        return
+    log.info("dispatching %s to %d receiver(s)", event_type, len(targets))
+    
+    deadline = event.get("queued_at", time.monotonic()) + 60.0
+    
     # One client per event keeps connection pools small while still
     # parallelizing delivery to all receivers.
     async with httpx.AsyncClient() as client:
         await asyncio.gather(
-            *(_deliver_one(client, url, body, key) for url, body, key in targets),
+            *(_deliver_one(client, url, body, key, deadline) for url, body, key in targets),
             return_exceptions=True,
         )
 
