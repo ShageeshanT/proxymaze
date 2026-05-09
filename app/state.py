@@ -84,10 +84,12 @@ class State:
     integrations: list[Integration] = field(default_factory=list)
     metrics: Metrics = field(default_factory=Metrics)
     delivered_keys: set[str] = field(default_factory=set)
-    # Locks are created lazily on first access from inside an event loop
-    # so importing this module from sync contexts (e.g. tests) stays safe.
+    # Locks and queues are lazy so importing this module from sync
+    # contexts (e.g. tests, module load) stays safe — they're bound to
+    # the running event loop on first access.
     _alert_lock: asyncio.Lock | None = None
     _state_lock: asyncio.Lock | None = None
+    _event_queue: asyncio.Queue | None = None
 
     @property
     def alert_lock(self) -> asyncio.Lock:
@@ -101,6 +103,12 @@ class State:
             self._state_lock = asyncio.Lock()
         return self._state_lock
 
+    @property
+    def event_queue(self) -> asyncio.Queue:
+        if self._event_queue is None:
+            self._event_queue = asyncio.Queue()
+        return self._event_queue
+
     def reset(self) -> None:
         """Wipe everything — used by tests between cases."""
         self.config = Config()
@@ -113,6 +121,7 @@ class State:
         self.delivered_keys.clear()
         self._alert_lock = None
         self._state_lock = None
+        self._event_queue = None
 
 
 state = State()

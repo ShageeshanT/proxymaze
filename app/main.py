@@ -6,13 +6,15 @@ Routers are added incrementally as each phase is implemented.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
 from fastapi import FastAPI
 
-from app.routes import config, health, proxies
+from app.prober import prober_loop
+from app.routes import alerts, config, health, proxies
 
 logging.basicConfig(
     level=logging.INFO,
@@ -24,11 +26,18 @@ log = logging.getLogger("proxymaze")
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     log.info("ProxyMaze starting up")
-    # Background prober + dispatcher tasks will be created here in later phases.
+    prober_task = asyncio.create_task(prober_loop(), name="prober")
+    # Webhook dispatcher task is added in Phase 6.
     try:
         yield
     finally:
         log.info("ProxyMaze shutting down")
+        for task in (prober_task,):
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
 
 
 app = FastAPI(
@@ -41,3 +50,4 @@ app = FastAPI(
 app.include_router(health.router)
 app.include_router(config.router)
 app.include_router(proxies.router)
+app.include_router(alerts.router)
