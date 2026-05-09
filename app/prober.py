@@ -38,9 +38,11 @@ async def _probe_one(client: httpx.AsyncClient, url: str, timeout_s: float) -> b
     """
     try:
         r = await client.get(
-            url, timeout=timeout_s, follow_redirects=True, headers=_PROBE_HEADERS,
+            url, timeout=httpx.Timeout(timeout_s), follow_redirects=True, headers=_PROBE_HEADERS,
         )
         return 200 <= r.status_code < 300
+    except (httpx.TimeoutException, httpx.RequestError):
+        return False
     except Exception:
         return False
 

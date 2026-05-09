@@ -33,30 +33,36 @@ def _pool_snapshot() -> tuple[int, int, list[str], float]:
     return total, failed, failed_ids, failure_rate
 
 
-def _build_fired_payload(alert: Alert) -> dict:
-    return {
-        "event": "alert.fired",
-        "alert_id": alert.alert_id,
-        "fired_at": alert.fired_at,
-        "failure_rate": alert.failure_rate_at_fire,
-        "total_proxies": alert.total_at_fire,
-        "failed_proxies": alert.failed_at_fire,
-        "failed_proxy_ids": list(alert.failed_ids_at_fire),
-        "threshold": THRESHOLD,
-        "message": MESSAGE,
-    }
+def build_dynamic_payload_for_event(event_type: str, alert_id: str) -> dict | None:
+    """Builds the webhook payload dynamically using live pool values."""
+    alert = next((a for a in state.alerts if a.alert_id == alert_id), None)
+    if not alert:
+        return None
+
+    if event_type == "alert.fired":
+        total, failed, failed_ids, failure_rate = _pool_snapshot()
+        return {
+            "event": "alert.fired",
+            "alert_id": alert.alert_id,
+            "fired_at": alert.fired_at,
+            "failure_rate": failure_rate,
+            "total_proxies": total,
+            "failed_proxies": failed,
+            "failed_proxy_ids": failed_ids,
+            "threshold": THRESHOLD,
+            "message": MESSAGE,
+        }
+    elif event_type == "alert.resolved":
+        return {
+            "event": "alert.resolved",
+            "alert_id": alert.alert_id,
+            "resolved_at": alert.resolved_at,
+        }
+    return None
 
 
-def _build_resolved_payload(alert: Alert) -> dict:
-    return {
-        "event": "alert.resolved",
-        "alert_id": alert.alert_id,
-        "resolved_at": alert.resolved_at,
-    }
-
-
-async def _enqueue(event_type: str, payload: dict) -> None:
-    await state.event_queue.put({"type": event_type, "payload": payload})
+async def _enqueue(event_type: str, alert_id: str) -> None:
+    await state.event_queue.put({"type": event_type, "alert_id": alert_id})
 
 
 async def evaluate_alerts() -> None:
@@ -80,7 +86,7 @@ async def evaluate_alerts() -> None:
                 "alert FIRED %s rate=%s failed=%d/%d",
                 alert.alert_id, failure_rate, failed, total,
             )
-            await _enqueue("alert.fired", _build_fired_payload(alert))
+            await _enqueue("alert.fired", alert.alert_id)
             return
 
         if failure_rate < THRESHOLD and state.current_active_alert_id is not None:
@@ -99,7 +105,7 @@ async def evaluate_alerts() -> None:
                     alert.alert_id, failure_rate, failed, total,
                 )
                 state.current_active_alert_id = None
-                await _enqueue("alert.resolved", _build_resolved_payload(alert))
+                await _enqueue("alert.resolved", alert.alert_id)
 
 
 def serialize_alert(alert: Alert) -> dict:

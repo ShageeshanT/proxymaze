@@ -17,10 +17,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Iterable
 
 import httpx
 
+from app.alerts import build_dynamic_payload_for_event
 from app.state import state
 
 log = logging.getLogger("proxymaze.dispatcher")
@@ -36,30 +36,8 @@ DISPATCH_HEADERS = {
     "Accept": "*/*",
 }
 
-
-def _build_targets(event_type: str, payload: dict) -> list[tuple[str, dict, str]]:
-    """Resolve the (url, body, idempotency_key) tuples for an event."""
-    alert_id = payload.get("alert_id", "unknown")
-    targets: list[tuple[str, dict, str]] = []
-    for wh in list(state.webhooks.values()):
-        targets.append(
-            (wh.url, payload, f"{alert_id}:{event_type}:{wh.webhook_id}")
-        )
-    try:
-        from app.integrations import format_for_integration
-    except ImportError:
-        format_for_integration = None  # type: ignore[assignment]
-    for integ in list(state.integrations):
-        if event_type not in integ.events:
-            continue
-        if format_for_integration is None:
-            body = payload
-        else:
-            body = format_for_integration(integ, event_type, payload)
-        targets.append(
-            (integ.webhook_url, body, f"{alert_id}:{event_type}:{integ.integration_id}")
-        )
-    return targets
+_receiver_queues: dict[str, asyncio.Queue] = {}
+_receiver_tasks: dict[str, asyncio.Task] = {}
 
 
 async def _deliver_one(
@@ -100,18 +78,64 @@ async def _deliver_one(
             return
 
 
-async def deliver_event(event: dict) -> None:
-    targets = _build_targets(event["type"], event["payload"])
-    if not targets:
-        log.info("no receivers for %s", event["type"])
-        return
-    log.info("dispatching %s to %d receiver(s)", event["type"], len(targets))
-    # One client per event keeps connection pools small while still
-    # parallelizing delivery to all receivers.
+async def _receiver_worker(receiver_id: str, is_integration: bool) -> None:
+    """Background task processing events serially for a single receiver."""
+    queue = _receiver_queues[receiver_id]
+    try:
+        from app.integrations import format_for_integration
+    except ImportError:
+        format_for_integration = None  # type: ignore[assignment]
+
     async with httpx.AsyncClient() as client:
-        await asyncio.gather(
-            *(_deliver_one(client, url, body, key) for url, body, key in targets),
-            return_exceptions=True,
+        while True:
+            try:
+                event_type, alert_id = await queue.get()
+            except asyncio.CancelledError:
+                break
+
+            try:
+                # 1. Dynamically generate the payload using live pool state
+                base_payload = build_dynamic_payload_for_event(event_type, alert_id)
+                if not base_payload:
+                    log.warning("could not build payload for %s %s", event_type, alert_id)
+                    continue
+
+                # 2. Resolve receiver details
+                url = None
+                body = None
+                key = f"{alert_id}:{event_type}:{receiver_id}"
+
+                if not is_integration:
+                    wh = state.webhooks.get(receiver_id)
+                    if wh:
+                        url = wh.url
+                        body = base_payload
+                else:
+                    integ = next((i for i in state.integrations if i.integration_id == receiver_id), None)
+                    if integ and event_type in integ.events:
+                        url = integ.webhook_url
+                        if format_for_integration is None:
+                            body = base_payload
+                        else:
+                            body = format_for_integration(integ, event_type, base_payload)
+
+                if url and body:
+                    await _deliver_one(client, url, body, key)
+
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                log.exception("worker failed for receiver %s", receiver_id)
+            finally:
+                queue.task_done()
+
+
+def _ensure_worker(receiver_id: str, is_integration: bool) -> None:
+    if receiver_id not in _receiver_queues:
+        _receiver_queues[receiver_id] = asyncio.Queue()
+        _receiver_tasks[receiver_id] = asyncio.create_task(
+            _receiver_worker(receiver_id, is_integration),
+            name=f"dispatcher-{receiver_id}"
         )
 
 
@@ -127,12 +151,24 @@ async def dispatcher_loop() -> None:
                 log.exception("event_queue.get failed; continuing")
                 await asyncio.sleep(0.1)
                 continue
-            try:
-                await deliver_event(event)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                log.exception("dispatch failed for event %s", event.get("type"))
+            
+            event_type = event["type"]
+            alert_id = event["alert_id"]
+            
+            # Fan out to all webhooks
+            for wh in list(state.webhooks.values()):
+                _ensure_worker(wh.webhook_id, False)
+                _receiver_queues[wh.webhook_id].put_nowait((event_type, alert_id))
+            
+            # Fan out to all integrations
+            for integ in list(state.integrations):
+                if event_type in integ.events:
+                    _ensure_worker(integ.integration_id, True)
+                    _receiver_queues[integ.integration_id].put_nowait((event_type, alert_id))
+
     except asyncio.CancelledError:
         log.info("dispatcher loop cancelled")
+        for task in _receiver_tasks.values():
+            task.cancel()
         raise
+
