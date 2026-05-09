@@ -131,6 +131,64 @@ async def test_b8_8_resolved_shape(
     assert isinstance(resolved["attachments"][0]["ts"], int)
 
 
+async def test_b8_block_kit_present(
+    client: httpx.AsyncClient, proxy_server: MockProxyServer, receiver: MockReceiver
+) -> None:
+    """Block Kit bonus: payload also contains a ``blocks`` array."""
+    await _setup_breach(client, proxy_server, receiver)
+    ok = await wait_for(lambda: any(e["path"] == "/slack" for e in receiver.received), timeout=5)
+    assert ok
+    body = next(e for e in receiver.received if e["path"] == "/slack")["body"]
+    assert isinstance(body.get("blocks"), list) and body["blocks"]
+    types = {b.get("type") for b in body["blocks"]}
+    assert "header" in types
+    assert "section" in types
+
+
+async def test_b8_block_kit_field_substrings(
+    client: httpx.AsyncClient, proxy_server: MockProxyServer, receiver: MockReceiver
+) -> None:
+    """Block Kit fields contain the same required substrings as legacy attachments."""
+    await _setup_breach(client, proxy_server, receiver)
+    ok = await wait_for(lambda: any(e["path"] == "/slack" for e in receiver.received), timeout=5)
+    assert ok
+    body = next(e for e in receiver.received if e["path"] == "/slack")["body"]
+    # Concatenate all text from all blocks
+    blob = ""
+    for b in body["blocks"]:
+        text = b.get("text")
+        if isinstance(text, dict):
+            blob += " " + text.get("text", "")
+        for f in b.get("fields", []) or []:
+            if isinstance(f, dict):
+                blob += " " + f.get("text", "")
+    blob = blob.lower()
+    for needle in REQUIRED_TITLES:
+        assert needle in blob, f"Block Kit missing substring: {needle!r}"
+
+
+async def test_b9_discord_embed_has_timestamp(
+    client: httpx.AsyncClient, proxy_server: MockProxyServer, receivers
+) -> None:
+    """Discord embed includes ``timestamp`` field that embed validators look for."""
+    rcv = receivers()
+    await client.post("/config", json={"check_interval_seconds": 1, "request_timeout_ms": 800})
+    await client.post("/integrations", json={
+        "type": "discord", "webhook_url": rcv.url_for("discord"),
+    })
+    for i in range(5):
+        proxy_server.set(f"px-{i}", status=503 if i < 2 else 200)
+    await client.post(
+        "/proxies",
+        json={"proxies": [proxy_server.url_for(f"px-{i}") for i in range(5)], "replace": True},
+    )
+    ok = await wait_for(lambda: any(e["path"] == "/discord" for e in rcv.received), timeout=5)
+    assert ok
+    body = next(e for e in rcv.received if e["path"] == "/discord")["body"]
+    ts = body["embeds"][0].get("timestamp")
+    assert isinstance(ts, str) and ts
+
+
 async def test_b8_9_event_filter_only_fired(
     client: httpx.AsyncClient, proxy_server: MockProxyServer, receiver: MockReceiver
 ) -> None:
