@@ -31,16 +31,21 @@ _PROBE_HEADERS = {
 
 
 async def _probe_one(client: httpx.AsyncClient, url: str, timeout_s: float) -> bool:
-    """Return True iff the URL eventually replied 2xx within the timeout.
+    """Return True iff the URL replied 2xx OR 3xx within the timeout.
 
-    Follows redirects (capture servers commonly return 301/302) so a
-    healthy URL that bounces through a CDN still classifies as ``up``.
+    Redirect responses (301/302/etc) count as ``up`` — the server is
+    alive and responding. We deliberately do NOT follow redirects:
+    capture servers under test commonly return a 301 to an HTTPS
+    endpoint that may be unreachable from this network (502 Bad
+    Gateway), and following the chain would misclassify every healthy
+    proxy as ``down``. A 4xx, 5xx, timeout, or connection error stays
+    ``down``.
     """
     try:
         r = await client.get(
-            url, timeout=timeout_s, follow_redirects=True, headers=_PROBE_HEADERS,
+            url, timeout=timeout_s, follow_redirects=False, headers=_PROBE_HEADERS,
         )
-        return 200 <= r.status_code < 300
+        return 200 <= r.status_code < 400
     except Exception:
         return False
 

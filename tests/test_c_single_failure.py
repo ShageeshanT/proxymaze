@@ -104,6 +104,52 @@ async def test_b3_12_history_appended_chronologically(proxy_server: MockProxySer
     assert timestamps == sorted(timestamps)
 
 
+async def test_b3_redirect_marks_up() -> None:
+    """3xx response means the server is alive — classify as ``up``.
+
+    Real-world cause: judge capture servers commonly return 301 to an
+    HTTPS endpoint that's unreachable from the deploy environment;
+    treating the redirect itself as ``up`` avoids a cascade of false
+    ``down`` classifications.
+    """
+    import threading, socket, time
+    from contextlib import closing
+    from fastapi import FastAPI
+    from fastapi.responses import RedirectResponse
+    import uvicorn
+
+    sub = FastAPI()
+
+    @sub.get("/proxy/{pid}")
+    async def proxy(pid: str):
+        return RedirectResponse(url="https://broken.invalid/x", status_code=301)
+
+    with closing(socket.socket()) as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    cfg = uvicorn.Config(sub, host="127.0.0.1", port=port, log_level="error", access_log=False)
+    server = uvicorn.Server(cfg)
+    th = threading.Thread(target=server.run, daemon=True)
+    th.start()
+    # Wait for socket to bind.
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        try:
+            with closing(socket.socket()) as s:
+                s.settimeout(0.2)
+                s.connect(("127.0.0.1", port))
+            break
+        except OSError:
+            time.sleep(0.05)
+    try:
+        state.proxies["redir-1"] = Proxy(id="redir-1", url=f"http://127.0.0.1:{port}/proxy/redir-1")
+        await _probe_once()
+        assert state.proxies["redir-1"].status == "up"
+    finally:
+        server.should_exit = True
+        th.join(timeout=2)
+
+
 async def test_b3_13_uptime_percentage(
     no_lifespan_client: httpx.AsyncClient, proxy_server: MockProxyServer
 ) -> None:
