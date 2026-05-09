@@ -104,17 +104,18 @@ async def test_b3_12_history_appended_chronologically(proxy_server: MockProxySer
     assert timestamps == sorted(timestamps)
 
 
-async def test_b3_redirect_marks_up() -> None:
-    """3xx response means the server is alive — classify as ``up``.
+async def test_b3_redirect_to_502_marks_up() -> None:
+    """301 → 502 (Bad Gateway) classifies as ``up`` — trust the 3xx.
 
     Real-world cause: judge capture servers commonly return 301 to an
-    HTTPS endpoint that's unreachable from the deploy environment;
-    treating the redirect itself as ``up`` avoids a cascade of false
-    ``down`` classifications.
+    HTTPS endpoint whose CDN backend returns 502 from the deploy
+    environment. The 3xx itself proves the proxy is alive; treating the
+    final 502 as authoritative would falsely mark every healthy proxy
+    as ``down``.
     """
     import threading, socket, time
     from contextlib import closing
-    from fastapi import FastAPI
+    from fastapi import FastAPI, HTTPException
     from fastapi.responses import RedirectResponse
     import uvicorn
 
@@ -122,7 +123,11 @@ async def test_b3_redirect_marks_up() -> None:
 
     @sub.get("/proxy/{pid}")
     async def proxy(pid: str):
-        return RedirectResponse(url="https://broken.invalid/x", status_code=301)
+        return RedirectResponse(url=f"/upstream/{pid}", status_code=301)
+
+    @sub.get("/upstream/{pid}")
+    async def upstream(pid: str):
+        raise HTTPException(502)
 
     with closing(socket.socket()) as s:
         s.bind(("127.0.0.1", 0))
@@ -131,7 +136,6 @@ async def test_b3_redirect_marks_up() -> None:
     server = uvicorn.Server(cfg)
     th = threading.Thread(target=server.run, daemon=True)
     th.start()
-    # Wait for socket to bind.
     deadline = time.time() + 5
     while time.time() < deadline:
         try:
@@ -143,8 +147,52 @@ async def test_b3_redirect_marks_up() -> None:
             time.sleep(0.05)
     try:
         state.proxies["redir-1"] = Proxy(id="redir-1", url=f"http://127.0.0.1:{port}/proxy/redir-1")
-        await _probe_once()
+        await _probe_once(timeout_ms=2000)
         assert state.proxies["redir-1"].status == "up"
+    finally:
+        server.should_exit = True
+        th.join(timeout=2)
+
+
+async def test_b3_redirect_to_503_marks_down() -> None:
+    """301 → 503 (Service Unavailable) classifies as ``down`` —
+    503/504 are intentional "down" signals, not infra issues."""
+    import threading, socket, time
+    from contextlib import closing
+    from fastapi import FastAPI, HTTPException
+    from fastapi.responses import RedirectResponse
+    import uvicorn
+
+    sub = FastAPI()
+
+    @sub.get("/proxy/{pid}")
+    async def proxy(pid: str):
+        return RedirectResponse(url=f"/upstream/{pid}", status_code=301)
+
+    @sub.get("/upstream/{pid}")
+    async def upstream(pid: str):
+        raise HTTPException(503)
+
+    with closing(socket.socket()) as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    cfg = uvicorn.Config(sub, host="127.0.0.1", port=port, log_level="error", access_log=False)
+    server = uvicorn.Server(cfg)
+    th = threading.Thread(target=server.run, daemon=True)
+    th.start()
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        try:
+            with closing(socket.socket()) as s:
+                s.settimeout(0.2)
+                s.connect(("127.0.0.1", port))
+            break
+        except OSError:
+            time.sleep(0.05)
+    try:
+        state.proxies["redir-2"] = Proxy(id="redir-2", url=f"http://127.0.0.1:{port}/proxy/redir-2")
+        await _probe_once(timeout_ms=2000)
+        assert state.proxies["redir-2"].status == "down"
     finally:
         server.should_exit = True
         th.join(timeout=2)

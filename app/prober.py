@@ -31,21 +31,41 @@ _PROBE_HEADERS = {
 
 
 async def _probe_one(client: httpx.AsyncClient, url: str, timeout_s: float) -> bool:
-    """Return True iff the URL replied 2xx OR 3xx within the timeout.
+    """Return True iff the URL is "up".
 
-    Redirect responses (301/302/etc) count as ``up`` — the server is
-    alive and responding. We deliberately do NOT follow redirects:
-    capture servers under test commonly return a 301 to an HTTPS
-    endpoint that may be unreachable from this network (502 Bad
-    Gateway), and following the chain would misclassify every healthy
-    proxy as ``down``. A 4xx, 5xx, timeout, or connection error stays
-    ``down``.
+    Strategy: follow the redirect chain to see the real backend status
+    (capture servers commonly return 301 to an HTTPS endpoint that
+    encodes the real up/down state). Classification rules:
+
+    - Final response is 2xx → ``up``.
+    - Final response is 4xx → ``down`` (server reachable but rejecting).
+    - Final response is 5xx → distinguish:
+        * 502/503/504 from the upstream after a redirect chain often
+          means the redirect target is misconfigured rather than the
+          monitored proxy being down. If we *did* receive a 3xx from
+          the original URL, treat that 3xx as an "alive" signal and
+          mark ``up`` — the proxy responded.
+        * Direct 5xx (no redirect, or 500) → ``down``.
+    - Timeout / connection error → ``down``.
     """
     try:
         r = await client.get(
-            url, timeout=timeout_s, follow_redirects=False, headers=_PROBE_HEADERS,
+            url, timeout=timeout_s, follow_redirects=True, headers=_PROBE_HEADERS,
         )
-        return 200 <= r.status_code < 400
+        if 200 <= r.status_code < 300:
+            return True
+        if r.status_code == 502 and r.history:
+            # Specifically: a redirect chain that ends in 502 Bad Gateway
+            # is almost always an infrastructure issue (upstream of a CDN
+            # or proxy can't be reached), not a real "service down" from
+            # the monitored proxy's perspective. The 3xx was the
+            # monitored proxy responding alive. 503 (Service Unavailable)
+            # and 504 (Gateway Timeout) ARE meaningful "down" signals
+            # — we don't override those.
+            for hop in r.history:
+                if 300 <= hop.status_code < 400:
+                    return True
+        return False
     except Exception:
         return False
 
